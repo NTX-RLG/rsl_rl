@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,28 +9,34 @@
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from rsl_rl.modules import Discriminator, HimActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import HimRolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable
 
 
-class PPO:
+class AMPHIMPPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN
+    policy: HimActorCritic
+    discriminator: Discriminator
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN,
-        storage: RolloutStorage,
+        policy: HimActorCritic,
+        discriminator: Discriminator,
+        storage: HimRolloutStorage,
+        amp_expert_data,
+        amp_state_normalizer,
+        amp_style_reward_normalizer,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -39,6 +49,11 @@ class PPO:
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
+        discriminator_learning_rate: float = 1e-3,
+        discriminator_gradient_penalty_coef: float = 5,
+        discriminator_num_mini_batches: int = 10,
+        amp_replay_buffer_size: int = 100000,
+        discriminator_loss_function: str = "MSELoss",
         normalize_advantage_per_mini_batch: bool = False,
         device: str = "cpu",
         # RND parameters
@@ -90,8 +105,8 @@ class PPO:
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
-            if isinstance(policy, ActorCriticRecurrent):
-                raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
+            # if isinstance(policy, ActorCriticRecurrent):
+            #     raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
             # Store symmetry configuration
             self.symmetry = symmetry_cfg
         else:
@@ -101,12 +116,14 @@ class PPO:
         self.policy = policy
         self.policy.to(self.device)
 
-        # Create the optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # Create optimizer for PPO (exclude HIM estimator parameters)
+        # The HIM estimator has its own optimizer to avoid conflicts
+        ppo_params = [param for name, param in self.policy.named_parameters() if not name.startswith("him_estimator.")]
+        self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
 
         # Add storage
         self.storage = storage
-        self.transition = RolloutStorage.Transition()
+        self.transition = HimRolloutStorage.Transition()
 
         # PPO parameters
         self.clip_param = clip_param
@@ -123,6 +140,36 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+        # Discriminator components
+        self.discriminator = discriminator
+        self.discriminator.to(self.device)
+        self.amp_policy_data = ReplayBuffer(
+            discriminator.observation_dim, discriminator.observation_horizon, amp_replay_buffer_size, device
+        )
+        self.amp_expert_data = amp_expert_data
+        self.amp_state_normalizer = amp_state_normalizer
+        self.amp_style_reward_normalizer = amp_style_reward_normalizer
+
+        # Discriminator parameters
+        self.discriminator_gradient_penalty_coef = discriminator_gradient_penalty_coef
+        self.discriminator_loss_function = discriminator_loss_function
+        self.discriminator_num_mini_batches = discriminator_num_mini_batches
+
+        # Pre-instantiate loss functions to avoid repeated creation
+        if discriminator_loss_function == "BCEWithLogitsLoss":
+            self.disc_loss_fn = nn.BCEWithLogitsLoss()
+        elif discriminator_loss_function == "MSELoss":
+            self.disc_loss_fn = nn.MSELoss()
+        else:
+            self.disc_loss_fn = None  # For WassersteinLoss, we use custom computation
+
+        # Create optimizer
+        params = [
+            {"params": self.discriminator.architecture.parameters(), "weight_decay": 10e-4, "name": "amp_trunk"},
+            {"params": self.discriminator.discriminator_logits.parameters(), "weight_decay": 10e-2, "name": "amp_head"},
+        ]
+        self.discriminator_optimizer = optim.Adam(params, lr=discriminator_learning_rate, betas=(0.0, 0.9))
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
@@ -137,13 +184,21 @@ class PPO:
         return self.transition.actions
 
     def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+        self,
+        obs: TensorDict,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        extras: dict[str, torch.Tensor],
+        next_obs: torch.Tensor,
+        amp_observation_buf: torch.Tensor,
     ) -> None:
         # Update the normalizers
         self.policy.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
 
+        # Record the next obs
+        self.transition.next_observations = next_obs.clone()
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -163,7 +218,8 @@ class PPO:
             )
 
         # Record the transition
-        self.storage.add_transition(self.transition)
+        self.storage.add_transitions(self.transition)
+        self.amp_policy_data.insert(amp_observation_buf)
         self.transition.clear()
         self.policy.reset(dones)
 
@@ -190,10 +246,17 @@ class PPO:
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
-    def update(self) -> dict[str, float]:
+    def update(self) -> dict[str, float]:  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        # HIM loss
+        mean_estimate_loss = 0
+        mean_barlow_twin_loss = 0
+        # AMP loss
+        mean_discriminator_loss = 0
+        mean_policy_pred = 0
+        mean_expert_pred = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -205,22 +268,34 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # Iterate over batches
-        for (
-            obs_batch,
-            actions_batch,
-            target_values_batch,
-            advantages_batch,
-            returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
-            hidden_states_batch,
-            masks_batch,
-        ) in generator:
+        # generator for amp batches
+        amp_policy_generator = self.amp_policy_data.feed_forward_generator(
+            self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
+        )
+        amp_expert_generator = self.amp_expert_data.feed_forward_generator(
+            self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
+        )
+
+        for sample, sample_amp_policy, sample_expert_data in zip(generator, amp_policy_generator, amp_expert_generator):
+
+            (
+                obs_batch,
+                actions_batch,
+                next_obs_batch,
+                target_values_batch,
+                advantages_batch,
+                returns_batch,
+                old_actions_log_prob_batch,
+                old_mu_batch,
+                old_sigma_batch,
+                hidden_states_batch,
+                masks_batch,
+            ) = sample
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
-
+            obs_batch["next_obs"] = next_obs_batch
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -311,6 +386,60 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Discriminator update (before PPO update to avoid gradient conflicts)
+            sample_amp_expert, _ = sample_expert_data[0], sample_expert_data[1]
+            # Discriminator loss
+            if self.amp_state_normalizer is not None:
+                with torch.no_grad():
+                    # Reshape to [batch_size * horizon, obs_dim] for batch normalization
+                    policy_flat = sample_amp_policy.view(-1, sample_amp_policy.shape[-1])
+                    expert_flat = sample_amp_expert.view(-1, sample_amp_expert.shape[-1])
+
+                    # Batch normalize all frames at once
+                    policy_flat_norm = self.amp_state_normalizer.normalize_torch(policy_flat, self.device)
+                    expert_flat_norm = self.amp_state_normalizer.normalize_torch(expert_flat, self.device)
+
+                    # Flatten to final shape
+                    policy_data = policy_flat_norm.view(sample_amp_policy.shape[0], -1)
+                    expert_data = expert_flat_norm.view(sample_amp_expert.shape[0], -1)
+            else:
+                policy_data = sample_amp_policy.flatten(1, 2)
+                expert_data = sample_amp_expert.flatten(1, 2)
+
+            policy_d = self.discriminator(policy_data)
+            expert_d = self.discriminator(expert_data)
+
+            if self.discriminator_loss_function == "BCEWithLogitsLoss":
+                expert_loss = self.disc_loss_fn(expert_d, torch.ones_like(expert_d))
+                policy_loss = self.disc_loss_fn(policy_d, torch.zeros_like(policy_d))
+                grad_pen_loss = self.discriminator.compute_grad_pen(
+                    expert_data, lambda_=self.discriminator_gradient_penalty_coef
+                )
+            elif self.discriminator_loss_function == "MSELoss":
+                expert_loss = self.disc_loss_fn(expert_d, torch.ones_like(expert_d))
+                policy_loss = self.disc_loss_fn(policy_d, -torch.ones_like(policy_d))
+                grad_pen_loss = self.discriminator.compute_grad_pen(
+                    expert_data, lambda_=self.discriminator_gradient_penalty_coef
+                )
+            elif self.discriminator_loss_function == "WassersteinLoss":
+                expert_loss = -torch.tanh(0.3 * expert_d).mean()
+                policy_loss = torch.tanh(0.3 * policy_d).mean()
+                grad_pen_loss = self.discriminator.compute_wgan_grad_pen(expert_data, policy_data)
+            else:
+                raise ValueError("Unexpected loss function specified")
+
+            amp_loss = 0.5 * (expert_loss + policy_loss)
+
+            discriminator_loss = amp_loss + grad_pen_loss
+
+            self.discriminator_optimizer.zero_grad()
+            discriminator_loss.backward()
+            self.discriminator_optimizer.step()
+
+            if self.amp_state_normalizer is not None:
+                self.amp_state_normalizer.update(sample_amp_policy[:, 0].cpu().numpy())
+                self.amp_state_normalizer.update(sample_amp_expert[:, 0].cpu().numpy())
+
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions
@@ -372,16 +501,35 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(
+                [p for n, p in self.policy.named_parameters() if not n.startswith("him_estimator.")], self.max_grad_norm
+            )
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
+            # HIM Estimator Update (after PPO update, uses its own optimizer)
+            actor_obs_batch = self.policy.get_actor_obs(obs_batch)
+            actor_obs_batch = self.policy.actor_obs_normalizer(actor_obs_batch)
+            # Use unnormalized critic obs for state extraction to avoid normalization mismatch
+            critic_obs_batch_raw = self.policy.get_critic_obs(obs_batch)
+            next_obs_batch = self.policy.actor_obs_normalizer(obs_batch["next_obs"])
+            estimation_loss, barlow_twin_loss = self.policy.him_estimator.update(
+                actor_obs_batch, critic_obs_batch_raw, next_obs_batch, lr=self.learning_rate
+            )
+
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            # HIM loss
+            mean_estimate_loss += estimation_loss
+            mean_barlow_twin_loss += barlow_twin_loss
+            # AMP loss
+            mean_discriminator_loss += discriminator_loss.item()
+            mean_policy_pred += policy_d.mean().item()
+            mean_expert_pred += expert_d.mean().item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -398,6 +546,12 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        mean_estimate_loss /= num_updates
+        mean_barlow_twin_loss /= num_updates
+        mean_discriminator_loss /= num_updates
+        mean_policy_pred /= num_updates
+        mean_expert_pred /= num_updates
+
         # Clear the storage
         self.storage.clear()
 
@@ -406,6 +560,11 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "estimate": mean_estimate_loss,
+            "barlow_twin": mean_barlow_twin_loss,
+            "amp_loss": mean_discriminator_loss,
+            "expert_pred": mean_expert_pred,
+            "policy_pred": mean_policy_pred,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -417,15 +576,16 @@ class PPO:
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
         # Obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+        model_params = [self.policy.state_dict(), self.discriminator.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
+        self.discriminator.load_state_dict(model_params[1])
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            self.rnd.predictor.load_state_dict(model_params[2])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -434,6 +594,7 @@ class PPO:
         """
         # Create a tensor to store the gradients
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        grads += [param.grad.view(-1) for param in self.discriminator.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
@@ -444,6 +605,7 @@ class PPO:
 
         # Get all parameters
         all_params = self.policy.parameters()
+        all_params = chain(all_params, self.discriminator.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
 

@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,28 +9,29 @@
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from rsl_rl.modules import HimActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import HimRolloutStorage
 from rsl_rl.utils import string_to_callable
 
 
-class PPO:
+class HIMPPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN
+    policy: HimActorCritic
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN,
-        storage: RolloutStorage,
+        policy: HimActorCritic,
+        storage: HimRolloutStorage,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -90,8 +95,8 @@ class PPO:
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
-            if isinstance(policy, ActorCriticRecurrent):
-                raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
+            # if isinstance(policy, ActorCriticRecurrent):
+            #     raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
             # Store symmetry configuration
             self.symmetry = symmetry_cfg
         else:
@@ -101,12 +106,14 @@ class PPO:
         self.policy = policy
         self.policy.to(self.device)
 
-        # Create the optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # Create optimizer for PPO (exclude HIM estimator parameters)
+        # The HIM estimator has its own optimizer to avoid conflicts
+        ppo_params = [param for name, param in self.policy.named_parameters() if not name.startswith("him_estimator.")]
+        self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
 
         # Add storage
         self.storage = storage
-        self.transition = RolloutStorage.Transition()
+        self.transition = HimRolloutStorage.Transition()
 
         # PPO parameters
         self.clip_param = clip_param
@@ -137,13 +144,15 @@ class PPO:
         return self.transition.actions
 
     def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor], next_obs: torch.Tensor
     ) -> None:
         # Update the normalizers
         self.policy.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
 
+        # Record the next obs
+        self.transition.next_observations = next_obs.clone()
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -190,10 +199,13 @@ class PPO:
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
-    def update(self) -> dict[str, float]:
+    def update(self) -> dict[str, float]:  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        # HIM loss
+        mean_estimate_loss = 0
+        mean_barlow_twin_loss = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -209,6 +221,7 @@ class PPO:
         for (
             obs_batch,
             actions_batch,
+            next_obs_batch,
             target_values_batch,
             advantages_batch,
             returns_batch,
@@ -220,7 +233,7 @@ class PPO:
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
-
+            obs_batch["next_obs"] = next_obs_batch
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -372,16 +385,31 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(
+                [p for n, p in self.policy.named_parameters() if not n.startswith("him_estimator.")], self.max_grad_norm
+            )
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
+            # HIM Estimator Update (after PPO update, uses its own optimizer)
+            actor_obs_batch = self.policy.get_actor_obs(obs_batch)
+            actor_obs_batch = self.policy.actor_obs_normalizer(actor_obs_batch)
+            # Use unnormalized critic obs for state extraction to avoid normalization mismatch
+            critic_obs_batch_raw = self.policy.get_critic_obs(obs_batch)
+            next_obs_batch = self.policy.actor_obs_normalizer(obs_batch["next_obs"])
+            estimation_loss, barlow_twin_loss = self.policy.him_estimator.update(
+                actor_obs_batch, critic_obs_batch_raw, next_obs_batch, lr=self.learning_rate
+            )
+
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            # HIM loss
+            mean_estimate_loss += estimation_loss
+            mean_barlow_twin_loss += barlow_twin_loss
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -398,6 +426,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        mean_estimate_loss /= num_updates
+        mean_barlow_twin_loss /= num_updates
         # Clear the storage
         self.storage.clear()
 
@@ -406,6 +436,8 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "estimate": mean_estimate_loss,
+            "barlow_twin": mean_barlow_twin_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
