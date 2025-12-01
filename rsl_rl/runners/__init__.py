@@ -10,8 +10,10 @@
 """Implementation of runners for environment-agent interaction."""
 
 from .amp_him_on_policy_runner import AmpHimOnPolicyRunner
-from .him_on_policy_runner import HimOnPolicyRunner
+from .amp_on_policy_runner import AmpOnPolicyRunner
 from .on_policy_runner import OnPolicyRunner
 from .distillation_runner import DistillationRunner
+from .him_on_policy_runner import HimOnPolicyRunner
 
-__all__ = ["AmpHimOnPolicyRunner", "DistillationRunner", "HimOnPolicyRunner", "OnPolicyRunner"]
+
+__all__ = ["AmpHimOnPolicyRunner", "AmpOnPolicyRunner", "DistillationRunner", "HimOnPolicyRunner", "OnPolicyRunner"]

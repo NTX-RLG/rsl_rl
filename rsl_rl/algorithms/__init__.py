@@ -10,6 +10,7 @@
 """Implementation of different RL agents."""
 
 from .amp_him_ppo import AMPHIMPPO
+from .amp_ppo import AMPPPO
 from .distillation import Distillation
 from .him_ppo import HIMPPO
 from .ppo import PPO
