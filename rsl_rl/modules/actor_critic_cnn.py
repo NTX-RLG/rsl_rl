@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,11 +9,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch.distributions import Normal
-from typing import Any
 
 from rsl_rl.networks import CNN, MLP, EmpiricalNormalization
 
@@ -75,9 +80,9 @@ class ActorCriticCNN(ActorCritic):
                 raise ValueError(f"Invalid observation shape for {obs_group}: {obs[obs_group].shape}")
 
         # Assert that there are 2D observations
-        assert self.actor_obs_groups_2d or self.critic_obs_groups_2d, (
-            "No 2D observations are provided. If this is intentional, use the ActorCritic module instead."
-        )
+        assert (
+            self.actor_obs_groups_2d or self.critic_obs_groups_2d
+        ), "No 2D observations are provided. If this is intentional, use the ActorCritic module instead."
 
         # Actor CNN
         if self.actor_obs_groups_2d:
@@ -87,9 +92,9 @@ class ActorCriticCNN(ActorCritic):
             if not all(isinstance(v, dict) for v in actor_cnn_cfg.values()):
                 actor_cnn_cfg = {group: actor_cnn_cfg for group in self.actor_obs_groups_2d}
             # Check that the number of configs matches the number of observation groups
-            assert len(actor_cnn_cfg) == len(self.actor_obs_groups_2d), (
-                "The number of CNN configurations must match the number of 2D actor observations."
-            )
+            assert len(actor_cnn_cfg) == len(
+                self.actor_obs_groups_2d
+            ), "The number of CNN configurations must match the number of 2D actor observations."
 
             # Create CNNs for each 2D actor observation
             self.actor_cnns = nn.ModuleDict()
@@ -133,9 +138,9 @@ class ActorCriticCNN(ActorCritic):
             if not all(isinstance(v, dict) for v in critic_cnn_cfg.values()):
                 critic_cnn_cfg = {group: critic_cnn_cfg for group in self.critic_obs_groups_2d}
             # Check that the number of configs matches the number of observation groups
-            assert len(critic_cnn_cfg) == len(self.critic_obs_groups_2d), (
-                "The number of CNN configurations must match the number of 2D critic observations."
-            )
+            assert len(critic_cnn_cfg) == len(
+                self.critic_obs_groups_2d
+            ), "The number of CNN configurations must match the number of 2D critic observations."
 
             # Create CNNs for each 2D critic observation
             self.critic_cnns = nn.ModuleDict()

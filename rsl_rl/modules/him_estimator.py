@@ -9,7 +9,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 import torch
 import torch.distributed as dist
@@ -90,9 +91,7 @@ class HimEstimator(nn.Module):
         enable_terrain_latent = terrain_latent_dim is not None and self.height_map_dim is not None
         if enable_terrain_latent:
             if self.height_map_offset is None:
-                raise ValueError(
-                    "height_map_offset must be provided when terrain latent modeling is enabled."
-                )
+                raise ValueError("height_map_offset must be provided when terrain latent modeling is enabled.")
             self.terrain_latent_head = self._build_terrain_latent_head(
                 enc_hidden_dims[-1],
                 terrain_latent_dim,

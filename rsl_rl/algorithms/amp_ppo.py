@@ -496,7 +496,6 @@ class AMPPPO:
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()

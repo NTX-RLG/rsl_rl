@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,12 +9,13 @@
 
 from __future__ import annotations
 
+import warnings
+from typing import Any, NoReturn
+
 import torch
 import torch.nn as nn
-import warnings
 from tensordict import TensorDict
 from torch.distributions import Normal
-from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState, Memory
 

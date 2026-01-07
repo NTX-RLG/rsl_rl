@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,10 +9,11 @@
 
 from __future__ import annotations
 
+from itertools import chain
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent
@@ -86,7 +91,7 @@ class PPO:
             # Check valid configuration
             if not callable(symmetry_cfg["data_augmentation_func"]):
                 raise ValueError(
-                    f"Symmetry configuration exists but the function is not callable: "
+                    "Symmetry configuration exists but the function is not callable: "
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry

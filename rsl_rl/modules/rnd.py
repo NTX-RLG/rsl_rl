@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,13 +9,18 @@
 
 from __future__ import annotations
 
+from typing import Any, NoReturn
+
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
-from typing import Any, NoReturn
 
 from rsl_rl.env import VecEnv
-from rsl_rl.networks import MLP, EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from rsl_rl.networks import (
+    MLP,
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+)
 
 
 class RandomNetworkDistillation(nn.Module):

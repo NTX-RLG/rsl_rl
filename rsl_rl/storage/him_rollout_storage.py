@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
-import torch
 from collections.abc import Generator
+
+import torch
 from tensordict import TensorDict
 
 from rsl_rl.networks import HiddenState

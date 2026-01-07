@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -8,7 +12,10 @@
 from .cnn import CNN
 from .memory import HiddenState, Memory
 from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+)
 
 __all__ = [
     "CNN",

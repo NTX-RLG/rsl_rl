@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,14 +9,16 @@
 
 from __future__ import annotations
 
-import git
 import importlib
 import os
 import pathlib
-import torch
 import warnings
+from collections.abc import Callable
+from typing import Any
+
+import git
+import torch
 from tensordict import TensorDict
-from typing import Any, Callable
 
 
 def get_param(param: Any, idx: int) -> Any:

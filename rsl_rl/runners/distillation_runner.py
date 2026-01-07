@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -7,8 +11,9 @@ from __future__ import annotations
 
 import os
 import time
-import torch
 from collections import deque
+
+import torch
 from tensordict import TensorDict
 
 import rsl_rl

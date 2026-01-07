@@ -9,8 +9,8 @@
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
 import warnings
+from typing import Any, NoReturn
 
 import torch
 import torch.nn as nn
@@ -104,7 +104,8 @@ class HimActorCritic(nn.Module):
             self.height_map_offset = num_critic_obs - self.num_one_step_obs - self.height_map_dim
             if self.height_map_offset < 0:
                 warnings.warn(
-                    "Computed height map offset is negative for the provided critic layout. Disabling height map inputs.",
+                    "Computed height map offset is negative for the provided critic layout. Disabling height map"
+                    " inputs.",
                     stacklevel=2,
                 )
                 self.height_map_dim = 0

@@ -362,7 +362,10 @@ class AmpOnPolicyRunner:
         if resumed_training:
             resumed_training = self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
             self.amp_state_normalizer.load_state_dict(loaded_dict["amp_state_normalizer"])
-            if self.amp_style_reward_normalizer is not None and loaded_dict.get("amp_style_reward_normalizer") is not None:
+            if (
+                self.amp_style_reward_normalizer is not None
+                and loaded_dict.get("amp_style_reward_normalizer") is not None
+            ):
                 self.amp_style_reward_normalizer.load_state_dict(loaded_dict["amp_style_reward_normalizer"])
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:

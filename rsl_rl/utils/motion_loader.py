@@ -313,7 +313,7 @@ class MotionLoaderE1:
             blend_linear_vel,
             blend_angular_vel,
             blend_joints_vel,
-            blend_contact_mask
+            blend_contact_mask,
         ])
 
     def feed_forward_generator(self, num_mini_batch, mini_batch_size):
@@ -378,12 +378,13 @@ class MotionLoaderE1:
 
     def get_joint_vel_batch(poses):
         return poses[:, MotionLoaderE1.JOINT_VEL_START_IDX : MotionLoaderE1.JOINT_VEL_END_IDX]
-    
+
     def get_contact_mask(pose):
         return pose[MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
 
     def get_contact_mask_batch(poses):
         return poses[:, MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
+
 
 class MotionLoaderE1_12DOF:
     POS_SIZE = 3
@@ -466,14 +467,17 @@ class MotionLoaderE1_12DOF:
                     root_rot = MotionLoaderE1_12DOF.get_root_rot(motion_data[f_i])
                     root_rot = QuaternionNormalize(root_rot)
                     root_rot = standardize_quaternion(root_rot)
-                    motion_data[f_i, MotionLoaderE1_12DOF.POS_SIZE : (MotionLoaderE1_12DOF.POS_SIZE + MotionLoaderE1_12DOF.ROT_SIZE)] = (
-                        root_rot
-                    )
+                    motion_data[
+                        f_i,
+                        MotionLoaderE1_12DOF.POS_SIZE : (MotionLoaderE1_12DOF.POS_SIZE + MotionLoaderE1_12DOF.ROT_SIZE),
+                    ] = root_rot
 
                 # Remove first 7 observation dimensions (root_pos, root_rot).
                 self.trajectories.append(
                     torch.tensor(
-                        motion_data[:, MotionLoaderE1_12DOF.ROOT_ROT_END_IDX : MotionLoaderE1_12DOF.CONTACT_MASK_END_IDX],
+                        motion_data[
+                            :, MotionLoaderE1_12DOF.ROOT_ROT_END_IDX : MotionLoaderE1_12DOF.CONTACT_MASK_END_IDX
+                        ],
                         dtype=torch.float32,
                         device=device,
                     )
@@ -659,12 +663,18 @@ class MotionLoaderE1_12DOF:
         root_pos0, root_pos1 = MotionLoaderE1_12DOF.get_root_pos(frame0), MotionLoaderE1_12DOF.get_root_pos(frame1)
         root_rot0, root_rot1 = MotionLoaderE1_12DOF.get_root_rot(frame0), MotionLoaderE1_12DOF.get_root_rot(frame1)
         joints0, joints1 = MotionLoaderE1_12DOF.get_joint_pose(frame0), MotionLoaderE1_12DOF.get_joint_pose(frame1)
-        tar_toe_pos_0, tar_toe_pos_1 = MotionLoaderE1_12DOF.get_key_pos_local(frame0), MotionLoaderE1_12DOF.get_key_pos_local(
+        tar_toe_pos_0, tar_toe_pos_1 = MotionLoaderE1_12DOF.get_key_pos_local(
+            frame0
+        ), MotionLoaderE1_12DOF.get_key_pos_local(frame1)
+        linear_vel_0, linear_vel_1 = MotionLoaderE1_12DOF.get_linear_vel(frame0), MotionLoaderE1_12DOF.get_linear_vel(
             frame1
         )
-        linear_vel_0, linear_vel_1 = MotionLoaderE1_12DOF.get_linear_vel(frame0), MotionLoaderE1_12DOF.get_linear_vel(frame1)
-        angular_vel_0, angular_vel_1 = MotionLoaderE1_12DOF.get_angular_vel(frame0), MotionLoaderE1_12DOF.get_angular_vel(frame1)
-        joint_vel_0, joint_vel_1 = MotionLoaderE1_12DOF.get_joint_vel(frame0), MotionLoaderE1_12DOF.get_joint_vel(frame1)
+        angular_vel_0, angular_vel_1 = MotionLoaderE1_12DOF.get_angular_vel(
+            frame0
+        ), MotionLoaderE1_12DOF.get_angular_vel(frame1)
+        joint_vel_0, joint_vel_1 = MotionLoaderE1_12DOF.get_joint_vel(frame0), MotionLoaderE1_12DOF.get_joint_vel(
+            frame1
+        )
 
         blend_root_pos = self.slerp(root_pos0, root_pos1, blend)
         blend_root_rot = np_quaternion_slerp(root_rot0.cpu().numpy(), root_rot1.cpu().numpy(), blend)
@@ -753,6 +763,7 @@ class MotionLoaderE1_12DOF:
 
     def get_contact_mask_batch(poses):
         return poses[:, MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
+
 
 # ---------------------------------------- utils ----------------------------------------
 def create_index_mapping(motion_joint_names, sim_joint_names):
