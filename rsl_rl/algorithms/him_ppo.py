@@ -10,11 +10,11 @@
 from __future__ import annotations
 
 from itertools import chain
-from tensordict import TensorDict
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tensordict import TensorDict
 
 from rsl_rl.modules import HimActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
@@ -91,7 +91,7 @@ class HIMPPO:
             # Check valid configuration
             if not callable(symmetry_cfg["data_augmentation_func"]):
                 raise ValueError(
-                    f"Symmetry configuration exists but the function is not callable: "
+                    "Symmetry configuration exists but the function is not callable: "
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
@@ -106,10 +106,8 @@ class HIMPPO:
         self.policy = policy
         self.policy.to(self.device)
 
-        # Create optimizer for PPO (exclude HIM estimator parameters)
-        # The HIM estimator has its own optimizer to avoid conflicts
-        ppo_params = [param for name, param in self.policy.named_parameters() if not name.startswith("him_estimator.")]
-        self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
+        # Create the optimizer
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         # Add storage
         self.storage = storage
@@ -144,7 +142,12 @@ class HIMPPO:
         return self.transition.actions
 
     def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor], next_obs: torch.Tensor
+        self,
+        obs: TensorDict,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        extras: dict[str, torch.Tensor],
+        next_obs: torch.Tensor,
     ) -> None:
         # Update the normalizers
         self.policy.update_normalization(obs)
@@ -385,9 +388,7 @@ class HIMPPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(
-                [p for n, p in self.policy.named_parameters() if not n.startswith("him_estimator.")], self.max_grad_norm
-            )
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:

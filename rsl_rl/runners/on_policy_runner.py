@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -8,9 +12,10 @@ from __future__ import annotations
 import os
 import statistics
 import time
-import torch
 import warnings
 from collections import deque
+
+import torch
 from tensordict import TensorDict
 
 import rsl_rl
@@ -147,6 +152,13 @@ class OnPolicyRunner:
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
+
+                # Synchronize normalizers
+                if self.is_distributed:
+                    self.alg.policy.actor_obs_normalizer.synchronize()
+                    self.alg.policy.critic_obs_normalizer.synchronize()
+                    if self.alg.rnd:
+                        self.alg.rnd.state_normalizer.synchronize()
 
                 # Compute returns
                 self.alg.compute_returns(obs)

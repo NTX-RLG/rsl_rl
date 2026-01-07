@@ -9,16 +9,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
 from rsl_rl.networks import MLP
 from rsl_rl.utils.utils import resolve_nn_activation
-
 
 LINEAR_VELOCITY_DIM: int = 3
 
@@ -29,24 +29,25 @@ class HimEstimator(nn.Module):
         temporal_steps: int,
         num_one_step_obs: int,
         num_one_step_priveleged_obs: int,
-        enc_hidden_dims: tuple[int] | list[int] = [256, 128, 64],
-        proj_hidden_dims: tuple[int] | list[int] = [256, 256],  # Projector hidden dims for Barlow Twins
-        estimation_targets: str | list[str] | None = None,
-        estimate_offsets: dict[str, int] | None = None,
+        enc_hidden_dims: Sequence[int] = [256, 128, 64],
+        proj_hidden_dims: Sequence[int] = [256, 256],  # Projector hidden dims for Barlow Twins
         height_map_dim: int | None = None,
-        height_map_hidden_dims: tuple[int] | list[int] = (512, 512, 256),
-        height_map_dropout: float = 0.1,
+        height_map_offset: int | None = None,
+        linear_velocity_offset: int = 0,
         activation: str = "elu",
         learning_rate: float = 1e-3,
         max_grad_norm: float = 10.0,
         barlow_lambda: float = 5e-3,  # Barlow Twins: weight for off-diagonal terms
         projector_output_dim: int = 256,  # Projector output dimension (higher dim for redundancy reduction)
+        terrain_latent_dim: int | None = None,
+        terrain_latent_hidden_dims: Sequence[int] = (256, 256),
+        terrain_latent_weight: float = 1.0,
+        terrain_latent_dropout: float = 0.1,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
             print(
-                "Estimator_CL.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs])
+                "Estimator_CL.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
             )
         super().__init__()
 
@@ -56,66 +57,17 @@ class HimEstimator(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.barlow_lambda = barlow_lambda
         self.projector_output_dim = projector_output_dim
-
-        if estimation_targets is None:
-            estimation_targets = ["linear_velocity"]
-        elif isinstance(estimation_targets, str):
-            estimation_targets = [estimation_targets]
-        else:
-            estimation_targets = list(estimation_targets)
-
-        estimation_targets = list(dict.fromkeys(t.lower() for t in estimation_targets))
-        if not estimation_targets:
-            raise ValueError("At least one estimation target must be specified.")
-
-        supported_targets = {"linear_velocity", "height_map"}
-        invalid = set(estimation_targets) - supported_targets
-        if invalid:
-            raise ValueError(f"Unsupported estimation targets: {sorted(invalid)}")
-
-        self.estimation_targets = tuple(estimation_targets)
-
-        self.target_dims = {}
-        for target in self.estimation_targets:
-            if target == "linear_velocity":
-                self.target_dims[target] = LINEAR_VELOCITY_DIM
-            elif target == "height_map":
-                if height_map_dim is None or height_map_dim <= 0:
-                    raise ValueError(
-                        "height_map_dim must be provided and positive when height map estimation is enabled."
-                    )
-                self.target_dims[target] = height_map_dim
-
-        self.estimate_dim = sum(self.target_dims.values())
-
-        if not isinstance(estimate_offsets, dict) or not estimate_offsets:
-            raise ValueError("estimate_offsets must be a non-empty dict with per-target privileged offsets.")
-
-        self.target_offsets = {}
-        for target in self.estimation_targets:
-            if target not in estimate_offsets:
-                raise ValueError(
-                    f"Missing estimate offset for target '{target}'. Pass estimate_offsets from the actor configuration."
-                )
-            self.target_offsets[target] = estimate_offsets[target]
+        self.terrain_latent_weight = terrain_latent_weight
+        self.height_map_dim = height_map_dim if height_map_dim and height_map_dim > 0 else None
+        self.height_map_offset = height_map_offset
+        self.linear_velocity_offset = linear_velocity_offset
+        self.estimate_dim = LINEAR_VELOCITY_DIM
 
         # Shared Encoder (Backbone) - processes temporal observations
         enc_input_dim = temporal_steps * self.num_one_step_obs
         self.encoder = MLP(enc_input_dim, enc_hidden_dims[-1], enc_hidden_dims[:-1], activation)
-        # Prediction heads (auxiliary estimation task)
-        self.pred_heads = nn.ModuleDict()
-        self.pred_activations = nn.ModuleDict()
-        for target in self.estimation_targets:
-            head, head_activation = self._build_prediction_head(
-                enc_hidden_dims[-1],
-                target,
-                height_map_dim,
-                height_map_hidden_dims,
-                height_map_dropout,
-                activation,
-            )
-            self.pred_heads[target] = head
-            self.pred_activations[target] = head_activation
+        # Linear velocity prediction head (auxiliary estimation task)
+        self.linear_velocity_head = MLP(enc_hidden_dims[-1], LINEAR_VELOCITY_DIM, [128, 64], activation)
 
         # Projector (MLP head) - projects representations to high-dimensional space
         # This is the key component in Barlow Twins for redundancy reduction
@@ -131,11 +83,42 @@ class HimEstimator(nn.Module):
         # normalization layer for the representations z1 and z2
         self.bn = nn.BatchNorm1d(projector_output_dim, affine=False)
 
+        # Terrain-specific latent modeling (optional)
+        self.terrain_latent_head: nn.Module | None = None
+        self.height_teacher: nn.Module | None = None
+        terrain_latent_dim = terrain_latent_dim if terrain_latent_dim and terrain_latent_dim > 0 else None
+        enable_terrain_latent = terrain_latent_dim is not None and self.height_map_dim is not None
+        if enable_terrain_latent:
+            if self.height_map_offset is None:
+                raise ValueError(
+                    "height_map_offset must be provided when terrain latent modeling is enabled."
+                )
+            self.terrain_latent_head = self._build_terrain_latent_head(
+                enc_hidden_dims[-1],
+                terrain_latent_dim,
+                terrain_latent_hidden_dims,
+                activation,
+                terrain_latent_dropout,
+            )
+            self.height_teacher = HeightMapTeacherEncoder(
+                num_samples=self.height_map_dim,
+                latent_dim=terrain_latent_dim,
+                mlp_hidden_dims=terrain_latent_hidden_dims,
+                dropout=terrain_latent_dropout,
+                activation=activation,
+            )
+            self.terrain_latent_dim = terrain_latent_dim
+        else:
+            self.terrain_latent_dim = 0
+            self.terrain_latent_weight = 0.0
+            self.height_map_offset = None
+
         # Optimizer
         self.learning_rate = learning_rate
         self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
 
-    def forward(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    @torch.inference_mode()
+    def forward(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for inference.
         Returns the state estimate and encoder representation (NOT projector output).
@@ -144,10 +127,13 @@ class HimEstimator(nn.Module):
         computing the cross-correlation matrix. For inference/policy, we use
         the encoder's representation directly.
         """
-        repr = self.encoder(obs_history.detach())
-        estimate = self._predict_from_latent(repr)
+        repr = self.encoder(obs_history)
+        estimate = self.linear_velocity_head(repr)
+        terrain_latent = None
+        if self.terrain_latent_head is not None:
+            terrain_latent = self.terrain_latent_head(repr)
         # Return encoder representation, NOT projector output
-        return estimate.detach(), repr.detach()
+        return estimate, repr, None if terrain_latent is None else terrain_latent
 
     def update(
         self,
@@ -171,24 +157,21 @@ class HimEstimator(nn.Module):
                 param_group["lr"] = self.learning_rate
 
         # Extract ground truth state for estimation loss
-        targets_state = {}
-        for target in self.estimation_targets:
-            dim = self.target_dims[target]
-            if dim == 0:
-                continue
-            start = -self.num_one_step_priveleged_obs + self.num_one_step_obs + self.target_offsets[target]
-            targets_state[target] = self._slice_target_state(critic_obs, start, dim).detach()
+        start = -self.num_one_step_priveleged_obs + self.num_one_step_obs + self.linear_velocity_offset
+        target_state = self._slice_target_state(critic_obs, start, LINEAR_VELOCITY_DIM).detach()
+
+        height_teacher_state = None
+        if self.height_teacher is not None and self.height_map_dim is not None and self.height_map_offset is not None:
+            start = -self.num_one_step_priveleged_obs + self.num_one_step_obs + self.height_map_offset
+            height_teacher_state = self._slice_target_state(critic_obs, start, self.height_map_dim).detach()
 
         # Pass both views through the SAME encoder (key point of Barlow Twins)
         # IMPORTANT: Do NOT detach inputs - we need gradients to flow back to encoder!
         repr_1 = self.encoder(obs)
         repr_2 = self.encoder(next_obs)
 
-        # Split into state estimate(s) and representations
-        state_estimates = {
-            target: self.pred_activations[target](self.pred_heads[target](repr_1))
-            for target in self.estimation_targets
-        }
+        # Linear velocity estimate from representation
+        lin_vel_estimate = self.linear_velocity_head(repr_1)
 
         # Project representations to high-dimensional space (Barlow Twins projector)
         z_1 = self.projector(repr_1)
@@ -198,11 +181,17 @@ class HimEstimator(nn.Module):
         # Cross-correlation matrix C: element C[i,j] is correlation between feature i and j
         batch_size = z_1.size(0)
         # empirical cross-correlation matrix
-        c = self.bn(z_1).T @ self.bn(z_2)
+        z1_norm = self.bn(z_1)
+        z2_norm = self.bn(z_2)
+        c = z1_norm.T @ z2_norm
 
         # sum the cross-correlation matrix between all gpus
-        c.div_(batch_size)
-        # torch.distributed.all_reduce(c)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(c)
+            world_size = dist.get_world_size()
+            c.div_(batch_size * world_size)
+        else:
+            c.div_(batch_size)
 
         on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
         off_diag = off_diagonal(c).pow_(2).sum()
@@ -211,56 +200,67 @@ class HimEstimator(nn.Module):
         barlow_loss = on_diag + self.barlow_lambda * off_diag
 
         # State estimation loss (auxiliary task)
-        estimation_loss = torch.tensor(0.0, device=barlow_loss.device)
-        for target, state in targets_state.items():
-            estimation_loss = estimation_loss + F.mse_loss(state, state_estimates[target])
+        estimation_loss = F.mse_loss(target_state, lin_vel_estimate)
+
+        terrain_latent_loss = torch.tensor(0.0, device=barlow_loss.device)
+        if self.terrain_latent_head is not None and height_teacher_state is not None:
+            pred_latent = self.terrain_latent_head(repr_1)
+            with torch.no_grad():
+                teacher_latent = self.height_teacher(height_teacher_state)
+            terrain_latent_loss = F.mse_loss(pred_latent, teacher_latent)
 
         # Combined loss
-        losses = estimation_loss + barlow_loss
+        losses = estimation_loss + barlow_loss + self.terrain_latent_weight * terrain_latent_loss
 
         self.optimizer.zero_grad()
         losses.backward()
+        self._reduce_gradients()
         nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
         return estimation_loss.item(), barlow_loss.item()
 
-    def _build_prediction_head(
-        self,
-        input_dim: int,
-        target_name: str,
-        height_map_dim: int | None,
-        height_map_hidden_dims: tuple[int] | list[int],
-        height_map_dropout: float,
-        activation: str,
-    ) -> tuple[nn.Module, nn.Module]:
-        if target_name == "height_map":
-            layers = []
-            prev_dim = input_dim
-            for hidden_dim in height_map_hidden_dims:
-                layers.append(nn.Linear(prev_dim, hidden_dim))
-                layers.append(nn.LayerNorm(hidden_dim))
-                layers.append(resolve_nn_activation(activation))
-                if height_map_dropout > 0:
-                    layers.append(nn.Dropout(height_map_dropout))
-                prev_dim = hidden_dim
-            layers.append(nn.Linear(prev_dim, height_map_dim))
-            return nn.Sequential(*layers), nn.Tanh()
+    def _reduce_gradients(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
 
-        if target_name == "linear_velocity":
-            return MLP(input_dim, LINEAR_VELOCITY_DIM, [128, 64], activation), nn.Identity()
+        grads = [param.grad.view(-1) for param in self.parameters() if param.grad is not None]
+        if not grads:
+            return
+        all_grads = torch.cat(grads)
+        dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
+        all_grads /= dist.get_world_size()
 
-        raise ValueError(f"Unsupported estimation target '{target_name}'.")
-
-    def _predict_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        if not self.estimation_targets:
-            return torch.zeros(latent.size(0), 0, device=latent.device)
-        estimates = [self.pred_activations[t](self.pred_heads[t](latent)) for t in self.estimation_targets]
-        return torch.cat(estimates, dim=-1)
+        offset = 0
+        for param in self.parameters():
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel
 
     def predict_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        """Public helper so exporters can reuse the prediction heads."""
-        return self._predict_from_latent(latent)
+        """Public helper so exporters can reuse the prediction head."""
+        return self.linear_velocity_head(latent)
+
+    def _build_terrain_latent_head(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int] | list[int],
+        activation: str,
+        dropout: float,
+    ) -> nn.Module:
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(resolve_nn_activation(activation))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        return nn.Sequential(*layers)
 
     def _slice_target_state(self, critic_obs: torch.Tensor, relative_start: int, dim: int) -> torch.Tensor:
         """Convert relative offsets (which may be negative) into valid tensor slices."""
@@ -268,17 +268,15 @@ class HimEstimator(nn.Module):
             raise ValueError("Target dimension must be positive.")
 
         critic_dim = critic_obs.size(-1)
-        end = relative_start + dim
 
         start_idx = relative_start if relative_start >= 0 else critic_dim + relative_start
-        end_idx = end if end > 0 else critic_dim + end
 
-        if not (0 <= start_idx < critic_dim) or not (0 < end_idx <= critic_dim) or end_idx <= start_idx:
+        if start_idx < 0 or start_idx + dim > critic_dim:
             raise IndexError(
-                f"Invalid slice for target state: start={relative_start}, dim={dim}, critic_dim={critic_dim}."
+                f"Invalid slice: start={relative_start} (idx={start_idx}), dim={dim}, critic_dim={critic_dim}."
             )
 
-        return critic_obs[:, start_idx:end_idx]
+        return critic_obs.narrow(dim=-1, start=start_idx, length=dim)
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         """Load the parameters of the actor-critic model.
@@ -294,6 +292,38 @@ class HimEstimator(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+
+class HeightMapTeacherEncoder(nn.Module):
+    """Convolutional encoder that compresses ~200 local height samples into a compact latent."""
+
+    def __init__(
+        self,
+        num_samples: int,
+        latent_dim: int,
+        mlp_hidden_dims: tuple[int] | list[int],
+        dropout: float,
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if num_samples is None or num_samples <= 0:
+            raise ValueError("num_samples must be positive for height-map encoding.")
+        self.num_samples = num_samples
+
+        mlp_layers: list[nn.Module] = []
+        prev_dim = num_samples
+        for hidden_dim in mlp_hidden_dims:
+            mlp_layers.append(nn.Linear(prev_dim, hidden_dim))
+            mlp_layers.append(nn.LayerNorm(hidden_dim))
+            mlp_layers.append(resolve_nn_activation(activation))
+            if dropout > 0:
+                mlp_layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        mlp_layers.append(nn.Linear(prev_dim, latent_dim))
+        self.mlp = nn.Sequential(*mlp_layers)
+
+    def forward(self, height_samples: torch.Tensor) -> torch.Tensor:
+        return self.mlp(height_samples)
 
 
 def off_diagonal(x: torch.Tensor) -> torch.Tensor:

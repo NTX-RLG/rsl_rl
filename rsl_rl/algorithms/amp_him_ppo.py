@@ -10,11 +10,11 @@
 from __future__ import annotations
 
 from itertools import chain
-from tensordict import TensorDict
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tensordict import TensorDict
 
 from rsl_rl.modules import Discriminator, HimActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
@@ -101,7 +101,7 @@ class AMPHIMPPO:
             # Check valid configuration
             if not callable(symmetry_cfg["data_augmentation_func"]):
                 raise ValueError(
-                    f"Symmetry configuration exists but the function is not callable: "
+                    "Symmetry configuration exists but the function is not callable: "
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
@@ -116,10 +116,8 @@ class AMPHIMPPO:
         self.policy = policy
         self.policy.to(self.device)
 
-        # Create optimizer for PPO (exclude HIM estimator parameters)
-        # The HIM estimator has its own optimizer to avoid conflicts
-        ppo_params = [param for name, param in self.policy.named_parameters() if not name.startswith("him_estimator.")]
-        self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
+        # Create the optimizer
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         # Add storage
         self.storage = storage
@@ -161,7 +159,7 @@ class AMPHIMPPO:
         elif discriminator_loss_function == "MSELoss":
             self.disc_loss_fn = nn.MSELoss()
         else:
-            self.disc_loss_fn = None  # For WassersteinLoss, we use custom computation
+            self.disc_loss_fn = None
 
         # Create optimizer
         params = [
@@ -218,7 +216,7 @@ class AMPHIMPPO:
             )
 
         # Record the transition
-        self.storage.add_transitions(self.transition)
+        self.storage.add_transition(self.transition)
         self.amp_policy_data.insert(amp_observation_buf)
         self.transition.clear()
         self.policy.reset(dones)
@@ -279,7 +277,6 @@ class AMPHIMPPO:
         )
 
         for sample, sample_amp_policy, sample_expert_data in zip(generator, amp_policy_generator, amp_expert_generator):
-
             (
                 obs_batch,
                 actions_batch,
@@ -293,6 +290,7 @@ class AMPHIMPPO:
                 hidden_states_batch,
                 masks_batch,
             ) = sample
+
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
             obs_batch["next_obs"] = next_obs_batch
@@ -396,8 +394,8 @@ class AMPHIMPPO:
                     expert_flat = sample_amp_expert.view(-1, sample_amp_expert.shape[-1])
 
                     # Batch normalize all frames at once
-                    policy_flat_norm = self.amp_state_normalizer.normalize_torch(policy_flat, self.device)
-                    expert_flat_norm = self.amp_state_normalizer.normalize_torch(expert_flat, self.device)
+                    policy_flat_norm = self.amp_state_normalizer(policy_flat)
+                    expert_flat_norm = self.amp_state_normalizer(expert_flat)
 
                     # Flatten to final shape
                     policy_data = policy_flat_norm.view(sample_amp_policy.shape[0], -1)
@@ -434,11 +432,14 @@ class AMPHIMPPO:
 
             self.discriminator_optimizer.zero_grad()
             discriminator_loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_discriminator_gradients()
             self.discriminator_optimizer.step()
 
             if self.amp_state_normalizer is not None:
-                self.amp_state_normalizer.update(sample_amp_policy[:, 0].cpu().numpy())
-                self.amp_state_normalizer.update(sample_amp_expert[:, 0].cpu().numpy())
+                with torch.no_grad():
+                    self.amp_state_normalizer.update(sample_amp_policy[:, 0])
+                    self.amp_state_normalizer.update(sample_amp_expert[:, 0])
 
             # Symmetry loss
             if self.symmetry:
@@ -501,9 +502,7 @@ class AMPHIMPPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(
-                [p for n, p in self.policy.named_parameters() if not n.startswith("him_estimator.")], self.max_grad_norm
-            )
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
@@ -594,7 +593,6 @@ class AMPHIMPPO:
         """
         # Create a tensor to store the gradients
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
-        grads += [param.grad.view(-1) for param in self.discriminator.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
@@ -605,13 +603,33 @@ class AMPHIMPPO:
 
         # Get all parameters
         all_params = self.policy.parameters()
-        all_params = chain(all_params, self.discriminator.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
 
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
         for param in all_params:
+            if param.grad is not None:
+                numel = param.numel()
+                # Copy data back from shared buffer
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                # Update the offset for the next parameter
+                offset += numel
+
+    def reduce_discriminator_gradients(self) -> None:
+        """Collect gradients from all GPUs and average them."""
+        grads = [param.grad.view(-1) for param in self.discriminator.parameters() if param.grad is not None]
+        if not grads:
+            return
+        all_grads = torch.cat(grads)
+
+        # Average the gradients across all GPUs
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        # Update the gradients for all parameters with the reduced gradients
+        offset = 0
+        for param in self.discriminator.parameters():
             if param.grad is not None:
                 numel = param.numel()
                 # Copy data back from shared buffer

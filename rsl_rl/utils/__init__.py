@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -5,24 +9,4 @@
 
 """Helper functions."""
 
-from .utils import (
-    get_param,
-    resolve_nn_activation,
-    resolve_obs_groups,
-    resolve_optimizer,
-    split_and_pad_trajectories,
-    store_code_state,
-    string_to_callable,
-    unpad_trajectories,
-)
-
-__all__ = [
-    "get_param",
-    "resolve_nn_activation",
-    "resolve_obs_groups",
-    "resolve_optimizer",
-    "split_and_pad_trajectories",
-    "store_code_state",
-    "string_to_callable",
-    "unpad_trajectories",
-]
+from .utils import *

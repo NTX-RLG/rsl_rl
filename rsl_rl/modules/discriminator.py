@@ -28,7 +28,9 @@ class Discriminator(nn.Module):
         reward_lerp: float = 0.3,
         shape: tuple[int] | list[int] = [1024, 512],
         style_reward_function: str = "quad_mapping",
-        mask_dims: list[tuple[int, int]] | None = None,  # List of dimension ranges to mask, e.g., [(start1, end1), (start2, end2)]
+        mask_dims: (
+            list[tuple[int, int]] | None
+        ) = None,  # List of dimension ranges to mask, e.g., [(start1, end1), (start2, end2)]
         mask_joint_names: list[str] | None = None,  # List of joint names to mask (both position and velocity)
         joint_names: list[str] | None = None,  # List of all joint names in order
         **kwargs: dict[str, Any],
@@ -249,7 +251,7 @@ class Discriminator(nn.Module):
                 # Batch normalize: reshape all frames at once for efficiency
                 batch_size = state_buf.shape[0]
                 state_flat = state_buf.view(-1, state_buf.shape[-1])
-                state_flat_norm = state_normalizer.normalize_torch(state_flat, self.device)
+                state_flat_norm = state_normalizer(state_flat)
                 state_buf_norm = state_flat_norm.view(batch_size, -1)
                 d = self.eval_disc(state_buf_norm)
             else:
@@ -264,8 +266,8 @@ class Discriminator(nn.Module):
             elif self.style_reward_function == "wasserstein_mapping":
                 if style_reward_normalizer is not None:
                     d_clone = d.clone()
-                    style_reward = style_reward_normalizer.normalize_torch(d_clone, self.device)
-                    style_reward_normalizer.update(d.cpu().numpy())
+                    style_reward = style_reward_normalizer(d_clone)
+                    style_reward_normalizer.update(d.detach())
                 else:
                     style_reward = torch.exp(torch.tanh(0.3 * d)) - torch.exp(-1 * torch.ones_like(d))
             else:

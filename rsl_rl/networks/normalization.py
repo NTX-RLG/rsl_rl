@@ -1,3 +1,7 @@
+# BSD 3-Clause License
+# Copyright (c) 2025-2026, Beijing Noetix Robotics TECHNOLOGY CO.,LTD.
+# All rights reserved.
+
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
@@ -8,6 +12,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 
@@ -53,14 +58,62 @@ class EmpiricalNormalization(nn.Module):
             return
 
         count_x = x.shape[0]
+        mean_x = torch.mean(x, dim=0, keepdim=True)
+        var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
+
         self.count += count_x
         rate = count_x / self.count
-        var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
-        mean_x = torch.mean(x, dim=0, keepdim=True)
         delta_mean = mean_x - self._mean
         self._mean += rate * delta_mean
         self._var += rate * (var_x - self._var + delta_mean * (mean_x - self._mean))
         self._std = torch.sqrt(self._var)
+
+    @torch.jit.unused
+    def synchronize(self) -> None:
+        """
+        Synchronizes the running statistics across all connected GPUs.
+        This merges moments across workers using count-weighted formulas.
+
+        NOTE: Directly averaging mean/variance is incorrect when each rank sees
+        non-identically distributed data (common in RL) and can cause large
+        normalization jumps.
+        """
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        # Use population moments: E[x] and E[x^2]
+        # where var = E[x^2] - mean^2 (unbiased=False in update).
+        device = self._mean.device
+        dtype = torch.float64
+
+        local_count = self.count.to(device=device, dtype=dtype)
+        if local_count.item() <= 0:
+            return
+
+        local_mean = self._mean.to(dtype=dtype)
+        local_var = self._var.to(dtype=dtype)
+        local_ex2 = local_var + local_mean.square()
+
+        local_sum = local_mean * local_count
+        local_sum_ex2 = local_ex2 * local_count
+
+        dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sum_ex2, op=dist.ReduceOp.SUM)
+
+        if local_count.item() <= 0:
+            return
+
+        global_mean = local_sum / local_count
+        global_ex2 = local_sum_ex2 / local_count
+        global_var = torch.clamp(global_ex2 - global_mean.square(), min=0.0)
+
+        # Update local stats (keep original dtype)
+        self._mean.copy_(global_mean.to(dtype=self._mean.dtype))
+        self._var.copy_(global_var.to(dtype=self._var.dtype))
+        self._std = torch.sqrt(self._var)
+        # Update count (used for `until` gating)
+        self.count.copy_(local_count.to(dtype=self.count.dtype))
 
     @torch.jit.unused
     def inverse(self, y: torch.Tensor) -> torch.Tensor:

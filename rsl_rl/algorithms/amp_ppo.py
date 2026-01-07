@@ -382,8 +382,8 @@ class AMPPPO:
                     expert_flat = sample_amp_expert.view(-1, sample_amp_expert.shape[-1])
 
                     # Batch normalize all frames at once
-                    policy_flat_norm = self.amp_state_normalizer.normalize_torch(policy_flat, self.device)
-                    expert_flat_norm = self.amp_state_normalizer.normalize_torch(expert_flat, self.device)
+                    policy_flat_norm = self.amp_state_normalizer(policy_flat)
+                    expert_flat_norm = self.amp_state_normalizer(expert_flat)
 
                     # Flatten to final shape
                     policy_data = policy_flat_norm.view(sample_amp_policy.shape[0], -1)
@@ -420,11 +420,14 @@ class AMPPPO:
 
             self.discriminator_optimizer.zero_grad()
             discriminator_loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_discriminator_gradients()
             self.discriminator_optimizer.step()
 
             if self.amp_state_normalizer is not None:
-                self.amp_state_normalizer.update(sample_amp_policy[:, 0].cpu().numpy())
-                self.amp_state_normalizer.update(sample_amp_expert[:, 0].cpu().numpy())
+                with torch.no_grad():
+                    self.amp_state_normalizer.update(sample_amp_policy[:, 0])
+                    self.amp_state_normalizer.update(sample_amp_expert[:, 0])
 
             # Symmetry loss
             if self.symmetry:
@@ -562,7 +565,6 @@ class AMPPPO:
         """
         # Create a tensor to store the gradients
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
-        grads += [param.grad.view(-1) for param in self.discriminator.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
@@ -573,13 +575,33 @@ class AMPPPO:
 
         # Get all parameters
         all_params = self.policy.parameters()
-        all_params = chain(all_params, self.discriminator.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
 
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
         for param in all_params:
+            if param.grad is not None:
+                numel = param.numel()
+                # Copy data back from shared buffer
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                # Update the offset for the next parameter
+                offset += numel
+
+    def reduce_discriminator_gradients(self) -> None:
+        """Collect gradients from all GPUs and average them."""
+        grads = [param.grad.view(-1) for param in self.discriminator.parameters() if param.grad is not None]
+        if not grads:
+            return
+        all_grads = torch.cat(grads)
+
+        # Average the gradients across all GPUs
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        # Update the gradients for all parameters with the reduced gradients
+        offset = 0
+        for param in self.discriminator.parameters():
             if param.grad is not None:
                 numel = param.numel()
                 # Copy data back from shared buffer

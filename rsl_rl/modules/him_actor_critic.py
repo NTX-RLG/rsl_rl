@@ -9,15 +9,17 @@
 
 from __future__ import annotations
 
+from typing import Any, NoReturn
+import warnings
+
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch.distributions import Normal
-from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
 
-from .him_estimator import HimEstimator, LINEAR_VELOCITY_DIM
+from .him_estimator import LINEAR_VELOCITY_DIM, HimEstimator
 
 
 class HimActorCritic(nn.Module):
@@ -33,18 +35,25 @@ class HimActorCritic(nn.Module):
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
         critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
-        encoder_hidden_dims: tuple[int] | list[int] = [256, 128, 64],  # Encoder hidden dims (output will be encoder_hidden_dims[-1])
+        encoder_hidden_dims: tuple[int] | list[int] = [
+            256,
+            128,
+            64,
+        ],  # Encoder hidden dims (output will be encoder_hidden_dims[-1])
         projector_hidden_dims: tuple[int] | list[int] = [256, 256],  # Projector hidden dims for Barlow Twins
         projector_output_dim: int = 256,  # Projector output dim (only used in training)
-        estimation_targets: str | list[str] | None = None,
-        estimate_offsets: dict[str, int] | None = None,
         height_map_dim: int | None = None,
-        height_map_hidden_dims: tuple[int] | list[int] = (512, 512, 256),
-        height_map_dropout: float = 0.1,
+        height_map_offset: int | None = None,
+        linear_velocity_offset: int = 0,
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        use_height_latent: bool = True,
+        terrain_latent_dim: int = 128,
+        terrain_latent_hidden_dims: tuple[int] | list[int] = (256, 256),
+        terrain_latent_weight: float = 1.0,
+        terrain_latent_dropout: float = 0.1,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -53,34 +62,12 @@ class HimActorCritic(nn.Module):
             )
         super().__init__()
 
-        if estimation_targets is None:
-            estimation_targets = ["linear_velocity"]
-        elif isinstance(estimation_targets, str):
-            estimation_targets = [estimation_targets]
-        else:
-            estimation_targets = list(estimation_targets)
-
-        estimation_targets = list(dict.fromkeys(t.lower() for t in estimation_targets))
-        if not estimation_targets:
-            raise ValueError("At least one estimation target must be specified.")
-        supported_targets = {"linear_velocity", "height_map"}
-        invalid = set(estimation_targets) - supported_targets
-        if invalid:
-            raise ValueError(f"Unsupported estimation targets: {sorted(invalid)}")
-        self.estimation_targets = tuple(estimation_targets)
-
-        self.target_dims = {}
-        for target in self.estimation_targets:
-            if target == "linear_velocity":
-                self.target_dims[target] = LINEAR_VELOCITY_DIM
-            elif target == "height_map":
-                if height_map_dim is None or height_map_dim <= 0:
-                    raise ValueError(
-                        "height_map_dim must be provided and positive when height map estimation is enabled."
-                    )
-                self.target_dims[target] = height_map_dim
-
-        self.estimate_dim = sum(self.target_dims.values())
+        self.estimate_dim = LINEAR_VELOCITY_DIM
+        self.linear_velocity_offset = linear_velocity_offset
+        self.height_map_dim = height_map_dim if height_map_dim and height_map_dim > 0 else 0
+        self.use_height_latent = False
+        self.height_latent_dim = 0
+        self.actor_estimate_dim = self.estimate_dim
 
         # Get the observation dimensions
         self.obs_groups = obs_groups
@@ -96,29 +83,38 @@ class HimActorCritic(nn.Module):
         self.num_one_step_obs = num_one_step_obs
         history_size = int(num_actor_obs / num_one_step_obs)
 
+        privileged_budget = max(num_critic_obs - self.num_one_step_obs, 0)
+        if self.height_map_dim > privileged_budget:
+            warnings.warn(
+                "height_map_dim exceeds available critic privileged observations. Disabling height map inputs.",
+                stacklevel=2,
+            )
+            self.height_map_dim = 0
+
+        self.use_height_latent = bool(use_height_latent and terrain_latent_dim > 0 and self.height_map_dim > 0)
+        self.height_latent_dim = terrain_latent_dim if self.use_height_latent else 0
+
         # Encoder output dimension (for actor input)
         encoder_latent_dim = encoder_hidden_dims[-1]
-        estimate_offsets = estimate_offsets.copy() if isinstance(estimate_offsets, dict) else {}
 
-        self.target_offsets = {}
-        for target in self.estimation_targets:
-            offset = estimate_offsets.get(target)
-            if offset is None:
-                if target == "linear_velocity":
-                    offset = 0
-                else:
-                    offset = num_critic_obs - self.num_one_step_obs - self.target_dims[target]
-                    if offset < 0:
-                        raise ValueError(
-                            "Computed height map estimate offset is negative. Verify critic observation layout or set"
-                            " estimate_offsets manually."
-                        )
-            self.target_offsets[target] = offset
+        self.height_map_offset = height_map_offset
+        if self.height_map_dim == 0:
+            self.height_map_offset = None
+        elif self.height_map_offset is None:
+            self.height_map_offset = num_critic_obs - self.num_one_step_obs - self.height_map_dim
+            if self.height_map_offset < 0:
+                warnings.warn(
+                    "Computed height map offset is negative for the provided critic layout. Disabling height map inputs.",
+                    stacklevel=2,
+                )
+                self.height_map_dim = 0
+                self.height_map_offset = None
+                self.use_height_latent = False
+                self.height_latent_dim = 0
 
         # Actor: receives [current_obs, estimate, encoder_representation]
-        self.actor = MLP(
-            self.num_one_step_obs + self.estimate_dim + encoder_latent_dim, num_actions, actor_hidden_dims, activation
-        )
+        actor_input_dim = self.num_one_step_obs + self.actor_estimate_dim + encoder_latent_dim + self.height_latent_dim
+        self.actor = MLP(actor_input_dim, num_actions, actor_hidden_dims, activation)
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization
@@ -139,7 +135,6 @@ class HimActorCritic(nn.Module):
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
-
         # Estimator
         self.him_estimator = HimEstimator(
             temporal_steps=history_size,
@@ -147,12 +142,14 @@ class HimActorCritic(nn.Module):
             num_one_step_priveleged_obs=num_critic_obs,
             enc_hidden_dims=encoder_hidden_dims,
             proj_hidden_dims=projector_hidden_dims,
-            estimation_targets=self.estimation_targets,
-            estimate_offsets=self.target_offsets,
-            height_map_dim=height_map_dim,
-            height_map_hidden_dims=height_map_hidden_dims,
-            height_map_dropout=height_map_dropout,
+            height_map_dim=self.height_map_dim if self.height_map_dim > 0 else None,
+            height_map_offset=self.height_map_offset,
+            linear_velocity_offset=self.linear_velocity_offset,
             projector_output_dim=projector_output_dim,
+            terrain_latent_dim=self.height_latent_dim if self.use_height_latent else None,
+            terrain_latent_hidden_dims=terrain_latent_hidden_dims,
+            terrain_latent_weight=terrain_latent_weight,
+            terrain_latent_dropout=terrain_latent_dropout,
         )
         print(f"Estimator Encoder: {self.him_estimator.encoder}")
         print(f"Estimator Projector: {self.him_estimator.projector}")
@@ -193,8 +190,9 @@ class HimActorCritic(nn.Module):
 
     def _update_distribution(self, obs: torch.Tensor) -> None:
         with torch.no_grad():
-            estimates, latent = self.him_estimator(obs)
-        actor_input = torch.cat((obs[:, -self.num_one_step_obs :], estimates, latent), dim=-1)
+            estimates, latent, terrain_latent = self.him_estimator(obs)
+        height_latent = self._format_height_latent(terrain_latent, obs.size(0), obs.device, obs.dtype)
+        actor_input = torch.cat((obs[:, -self.num_one_step_obs :], estimates, latent, height_latent), dim=-1)
         # Compute mean
         mean = self.actor(actor_input)
         # Compute standard deviation
@@ -216,10 +214,10 @@ class HimActorCritic(nn.Module):
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        estimates, latent = self.him_estimator(obs)
-        actor_input = torch.cat((obs[:, -self.num_one_step_obs :], estimates, latent), dim=-1)
+        estimates, latent, terrain_latent = self.him_estimator(obs)
+        height_latent = self._format_height_latent(terrain_latent, obs.size(0), obs.device, obs.dtype)
+        actor_input = torch.cat((obs[:, -self.num_one_step_obs :], estimates, latent, height_latent), dim=-1)
         return self.actor(actor_input)
-
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_critic_obs(obs)
@@ -233,6 +231,15 @@ class HimActorCritic(nn.Module):
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic"]]
         return torch.cat(obs_list, dim=-1)
+
+    def _format_height_latent(
+        self, terrain_latent: torch.Tensor | None, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if self.height_latent_dim == 0:
+            return torch.zeros(batch_size, 0, device=device, dtype=dtype)
+        if terrain_latent is None:
+            return torch.zeros(batch_size, self.height_latent_dim, device=device, dtype=dtype)
+        return terrain_latent.to(device=device, dtype=dtype)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)

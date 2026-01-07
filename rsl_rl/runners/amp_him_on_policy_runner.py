@@ -14,9 +14,9 @@ import statistics
 import time
 import warnings
 from collections import deque
-from tensordict import TensorDict
 
 import torch
+from tensordict import TensorDict
 
 import rsl_rl
 from rsl_rl.algorithms import AMPHIMPPO
@@ -27,8 +27,9 @@ from rsl_rl.modules import (
     resolve_rnd_config,
     resolve_symmetry_config,
 )
+from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.storage import HimRolloutStorage
-from rsl_rl.utils import Normalizer, resolve_obs_groups, store_code_state
+from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.motion_loader import *
 
 
@@ -190,6 +191,17 @@ class AmpHimOnPolicyRunner:
                 collection_time = stop - start
                 start = stop
 
+                # Synchronize normalizers
+                if self.is_distributed:
+                    self.alg.policy.actor_obs_normalizer.synchronize()
+                    self.alg.policy.critic_obs_normalizer.synchronize()
+                    if self.alg.rnd:
+                        self.alg.rnd.state_normalizer.synchronize()
+                    if self.amp_state_normalizer is not None:
+                        self.amp_state_normalizer.synchronize()
+                    if self.amp_style_reward_normalizer is not None:
+                        self.amp_style_reward_normalizer.synchronize()
+
                 # Compute returns
                 self.alg.compute_returns(obs)
 
@@ -347,6 +359,10 @@ class AmpHimOnPolicyRunner:
             "estimator_state_dict": self.alg.policy.him_estimator.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "amp_state_normalizer": self.amp_state_normalizer.state_dict(),
+            "amp_style_reward_normalizer": (
+                self.amp_style_reward_normalizer.state_dict() if self.amp_style_reward_normalizer is not None else None
+            ),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -366,6 +382,9 @@ class AmpHimOnPolicyRunner:
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         if resumed_training:
             resumed_training = self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+            self.amp_state_normalizer.load_state_dict(loaded_dict["amp_state_normalizer"])
+            if self.amp_style_reward_normalizer is not None and loaded_dict.get("amp_style_reward_normalizer") is not None:
+                self.amp_style_reward_normalizer.load_state_dict(loaded_dict["amp_style_reward_normalizer"])
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
@@ -488,11 +507,15 @@ class AmpHimOnPolicyRunner:
 
         # Initialize the amp algorithm
         amp_expert_data: MotionLoaderE1 = self.env.unwrapped.motion_loader
-        self.amp_state_normalizer = Normalizer(self.env.unwrapped.motion_loader.observation_dim)
+        self.amp_state_normalizer = EmpiricalNormalization(
+            shape=[self.env.unwrapped.motion_loader.observation_dim], eps=1e-2, until=int(1e8)
+        ).to(self.device)
 
         normalize_style_reward = self.cfg["normalize_style_reward"]
         if normalize_style_reward:
-            self.amp_style_reward_normalizer = Normalizer(1)
+            self.amp_style_reward_normalizer = EmpiricalNormalization(shape=[1], eps=1e-2, until=int(1e8)).to(
+                self.device
+            )
         else:
             self.amp_style_reward_normalizer = None
 

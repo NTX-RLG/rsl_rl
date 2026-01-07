@@ -303,6 +303,7 @@ class MotionLoaderE1:
         blend_linear_vel = self.slerp(linear_vel_0, linear_vel_1, blend)
         blend_angular_vel = self.slerp(angular_vel_0, angular_vel_1, blend)
         blend_joints_vel = self.slerp(joint_vel_0, joint_vel_1, blend)
+        blend_contact_mask = MotionLoaderE1.get_contact_mask(frame0)
 
         return torch.cat([
             blend_root_pos,
@@ -312,6 +313,7 @@ class MotionLoaderE1:
             blend_linear_vel,
             blend_angular_vel,
             blend_joints_vel,
+            blend_contact_mask
         ])
 
     def feed_forward_generator(self, num_mini_batch, mini_batch_size):
@@ -376,6 +378,9 @@ class MotionLoaderE1:
 
     def get_joint_vel_batch(poses):
         return poses[:, MotionLoaderE1.JOINT_VEL_START_IDX : MotionLoaderE1.JOINT_VEL_END_IDX]
+    
+    def get_contact_mask(pose):
+        return pose[MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
 
     def get_contact_mask_batch(poses):
         return poses[:, MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
@@ -743,9 +748,11 @@ class MotionLoaderE1_12DOF:
     def get_joint_vel_batch(poses):
         return poses[:, MotionLoaderE1_12DOF.JOINT_VEL_START_IDX : MotionLoaderE1_12DOF.JOINT_VEL_END_IDX]
 
-    def get_contact_mask_batch(poses):
-        return poses[:, MotionLoaderE1_12DOF.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
+    def get_contact_mask(pose):
+        return pose[MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
 
+    def get_contact_mask_batch(poses):
+        return poses[:, MotionLoaderE1.CONTACT_MASK_START_IDX : MotionLoaderE1.CONTACT_MASK_END_IDX]
 
 # ---------------------------------------- utils ----------------------------------------
 def create_index_mapping(motion_joint_names, sim_joint_names):

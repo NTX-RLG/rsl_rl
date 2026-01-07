@@ -19,14 +19,21 @@ import torch
 from tensordict import TensorDict
 
 import rsl_rl
-from rsl_rl.algorithms import HIMPPO
+from rsl_rl.algorithms import AMPPPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import HimActorCritic, resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.storage import HimRolloutStorage
+from rsl_rl.modules import (
+    ActorCritic,
+    Discriminator,
+    resolve_rnd_config,
+    resolve_symmetry_config,
+)
+from rsl_rl.networks import EmpiricalNormalization
+from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_obs_groups, store_code_state
+from rsl_rl.utils.motion_loader import *
 
 
-class HimOnPolicyRunner:
+class AmpOnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
@@ -77,13 +84,16 @@ class HimOnPolicyRunner:
 
         # Start learning
         obs = self.env.get_observations().to(self.device)
+        amp_observation_buf = obs["discriminator"].clone().to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
         ep_infos = []
         rewbuffer = deque(maxlen=100)
+        srewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_sreward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # Create buffers for logging extrinsic and intrinsic rewards
@@ -110,18 +120,34 @@ class HimOnPolicyRunner:
                     actions = self.alg.act(obs)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    next_actor_obs = obs["policy"].clone().detach()
+                    next_amp_obs = obs["discriminator"][:, -1].clone().detach()
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process termination obs
                     termination_ids = extras["terminal_observations"].get("env_ids")
-                    termination_actor_obs = extras["terminal_observations"].get("policy")
+                    terminal_amp_states = extras["terminal_observations"].get("amp")
 
-                    if len(termination_ids) > 0:
-                        next_actor_obs[termination_ids] = termination_actor_obs.clone().detach()
+                    # Update amp observation buffer
+                    amp_observation_buf[:, :-1] = amp_observation_buf[:, 1:].clone()
+                    amp_observation_buf[:, -1] = next_amp_obs.clone()
+
+                    # Account for terminal states.
+                    amp_observation_buf_with_term = amp_observation_buf.clone().detach()
+                    amp_observation_buf_with_term[termination_ids] = terminal_amp_states
+
+                    rewards, style_rewards = self.alg.discriminator.predict_amp_reward(
+                        amp_observation_buf_with_term,
+                        rewards,
+                        self.amp_state_normalizer,
+                        self.amp_style_reward_normalizer,
+                    )
 
                     # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras, next_actor_obs)
+                    self.alg.process_env_step(obs, rewards, dones, extras, amp_observation_buf_with_term)
+
+                    # update reset amp_observation_buf
+                    amp_observation_buf[termination_ids] = obs["discriminator"][termination_ids]
+
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     # Book keeping
@@ -137,13 +163,16 @@ class HimOnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                        cur_sreward_sum += style_rewards
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        srewbuffer.extend(cur_sreward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
+                        cur_sreward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         if self.alg.rnd:
                             erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -161,6 +190,10 @@ class HimOnPolicyRunner:
                     self.alg.policy.critic_obs_normalizer.synchronize()
                     if self.alg.rnd:
                         self.alg.rnd.state_normalizer.synchronize()
+                    if self.amp_state_normalizer is not None:
+                        self.amp_state_normalizer.synchronize()
+                    if self.amp_style_reward_normalizer is not None:
+                        self.amp_style_reward_normalizer.synchronize()
 
                 # Compute returns
                 self.alg.compute_returns(obs)
@@ -181,7 +214,6 @@ class HimOnPolicyRunner:
 
             # Clear episode infos
             ep_infos.clear()
-            # Save code state
             if it == start_iter and not self.disable_logs:
                 # Obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
@@ -190,7 +222,6 @@ class HimOnPolicyRunner:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
@@ -250,6 +281,7 @@ class HimOnPolicyRunner:
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # Everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_style_reward", statistics.mean(locs["srewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
@@ -263,8 +295,7 @@ class HimOnPolicyRunner:
             log_string = (
                 f"""{"#" * width}\n"""
                 f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
+                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {locs["learn_time"]:.3f}s)\n"""
                 f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             )
             # Print losses
@@ -277,14 +308,14 @@ class HimOnPolicyRunner:
                     f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(locs["irewbuffer"]):.2f}\n"""
                 )
             log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
+            log_string += f"""{"Mean style reward:":>{pad}} {statistics.mean(locs['srewbuffer']):.2f}\n"""
             # Print episode information
             log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
         else:
             log_string = (
                 f"""{"#" * width}\n"""
                 f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
+                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {locs["learn_time"]:.3f}s)\n"""
                 f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             )
             for key, value in locs["loss_dict"].items():
@@ -296,16 +327,7 @@ class HimOnPolicyRunner:
             f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
             f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
             f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{"ETA:":>{pad}} {
-                time.strftime(
-                    "%H:%M:%S",
-                    time.gmtime(
-                        self.tot_time
-                        / (locs["it"] - locs["start_iter"] + 1)
-                        * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"])
-                    ),
-                )
-            }\n"""
+            f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time / (locs["it"] - locs["start_iter"] + 1) * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"])))}\n"""
         )
         print(log_string)
 
@@ -314,8 +336,12 @@ class HimOnPolicyRunner:
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             "actor_state_dict": self.alg.policy.actor.state_dict(),
-            "estimator_state_dict": self.alg.policy.him_estimator.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "amp_state_normalizer": self.amp_state_normalizer.state_dict(),
+            "amp_style_reward_normalizer": (
+                self.amp_style_reward_normalizer.state_dict() if self.amp_style_reward_normalizer is not None else None
+            ),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -333,8 +359,11 @@ class HimOnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
-        resumed_training = self.alg.policy.actor.load_state_dict(loaded_dict["actor_state_dict"])
-        self.alg.policy.him_estimator.load_state_dict(loaded_dict["estimator_state_dict"])
+        if resumed_training:
+            resumed_training = self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+            self.amp_state_normalizer.load_state_dict(loaded_dict["amp_state_normalizer"])
+            if self.amp_style_reward_normalizer is not None and loaded_dict.get("amp_style_reward_normalizer") is not None:
+                self.amp_style_reward_normalizer.load_state_dict(loaded_dict["amp_style_reward_normalizer"])
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
@@ -359,8 +388,8 @@ class HimOnPolicyRunner:
     def train_mode(self) -> None:
         # PPO
         self.alg.policy.train()
-        # HIM
-        self.alg.policy.him_estimator.train()
+        # AMP
+        self.discriminator.train()
         # RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()
@@ -368,8 +397,8 @@ class HimOnPolicyRunner:
     def eval_mode(self) -> None:
         # PPO
         self.alg.policy.eval()
-        # HIM
-        self.alg.policy.him_estimator.eval()
+        # AMP
+        self.discriminator.eval()
         # RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.eval()
@@ -421,7 +450,7 @@ class HimOnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> HIMPPO:
+    def _construct_algorithm(self, obs: TensorDict) -> AMPPPO:
         """Construct the actor-critic algorithm."""
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -443,24 +472,54 @@ class HimOnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: HimActorCritic = actor_critic_class(
+        actor_critic: ActorCritic = actor_critic_class(
             obs,
             self.cfg["obs_groups"],
             self.env.num_actions,
-            self.env.observation_space["policy"].shape[-1],
             **self.policy_cfg,
         ).to(self.device)
 
+        # Initialize the amp algorithm
+        amp_expert_data: MotionLoaderE1 = self.env.unwrapped.motion_loader
+        self.amp_state_normalizer = EmpiricalNormalization(
+            shape=[self.env.unwrapped.motion_loader.observation_dim], eps=1e-2, until=int(1e8)
+        ).to(self.device)
+
+        normalize_style_reward = self.cfg["normalize_style_reward"]
+        if normalize_style_reward:
+            self.amp_style_reward_normalizer = EmpiricalNormalization(shape=[1], eps=1e-2, until=int(1e8)).to(
+                self.device
+            )
+        else:
+            self.amp_style_reward_normalizer = None
+
+        self.discriminator = Discriminator(
+            observation_dim=self.env.unwrapped.motion_loader.observation_dim,
+            observation_horizon=self.env.unwrapped.motion_loader.reference_observation_horizon,
+            device=self.device,
+            reward_coef=self.cfg["amp_reward_coef"],
+            reward_lerp=self.cfg["amp_reward_lerp"],
+            shape=self.cfg["discriminator_shape"],
+            style_reward_function=self.cfg["style_reward_function"],
+            joint_names=self.cfg["joint_names"],
+            mask_joint_names=self.cfg["discriminator_mask_joint_names"],
+            mask_dims=self.cfg["discriminator_mask_dims"],
+        ).to(self.device)
+
         # Initialize the storage
-        storage = HimRolloutStorage(
+        storage = RolloutStorage(
             "rl", self.env.num_envs, self.num_steps_per_env, obs, [self.env.num_actions], self.device
         )
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: HIMPPO = alg_class(
+        alg: AMPPPO = alg_class(
             actor_critic,
+            self.discriminator,
             storage,
+            amp_expert_data,
+            self.amp_state_normalizer,
+            self.amp_style_reward_normalizer,
             device=self.device,
             **self.alg_cfg,
             multi_gpu_cfg=self.multi_gpu_cfg,
